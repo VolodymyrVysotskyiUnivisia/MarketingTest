@@ -1,156 +1,187 @@
-using MarketingTest.Base;
 using MarketingTest.Shared;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Query;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Net.Http;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace MarketingTest.Features.TelegramIntegration
-{ 
+{
     public class TelegramOutboundPlugin : IPlugin
     {
         public void Execute(IServiceProvider serviceProvider)
         {
             var tracer = (ITracingService)serviceProvider
                 .GetService(typeof(ITracingService));
+
             var context = (IPluginExecutionContext)serviceProvider
                 .GetService(typeof(IPluginExecutionContext));
+
             var serviceFactory = (IOrganizationServiceFactory)serviceProvider
                 .GetService(typeof(IOrganizationServiceFactory));
 
-            var service = serviceFactory.CreateOrganizationService(null);
+            var service = serviceFactory
+                .CreateOrganizationService(context.UserId);
 
-            if (context.InputParameters.Contains(Constants.Payload))
+            try
             {
-                try
+                tracer.Trace("TelegramOutboundPlugin started.");
+
+                var payload =
+                    context.InputParameters[Constants.Payload]?.ToString();
+
+                tracer.Trace($"Payload received: {payload}");
+
+                if (string.IsNullOrWhiteSpace(payload))
                 {
-                    tracer.Trace("Start of TelegramOutboundPlugin - {0}",
-                        DateTime.UtcNow);
+                    SetErrorResponse(
+                        context,
+                        "Payload is empty.");
 
-                    var payload = (string)context
-                        .InputParameters[Constants.Payload];
-                    tracer.Trace($"Payload received: {payload}");
+                    return;
+                }
 
-                    var messageText = ExtractValue(
-                        payload,
-                        TelegramConstants.TextKey);
-                    var chatId = ExtractValue(
-                        payload,
-                        TelegramConstants.ToKey);
+                var json = JObject.Parse(payload);
 
-                    tracer.Trace(
-                        $"Parsed Text: '{messageText}', ChatID: '{chatId}'");
+                var messageText =
+                    json["Message"]?["text"]?.ToString();
 
-                    if (!string.IsNullOrEmpty(messageText)
-                        && !string.IsNullOrEmpty(chatId))
+                var chatId =
+                    json["To"]?.ToString();
+
+                if (string.IsNullOrWhiteSpace(messageText))
+                {
+                    SetErrorResponse(
+                        context,
+                        "Message text is empty.");
+
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(chatId))
+                {
+                    SetErrorResponse(
+                        context,
+                        "Recipient chat id is empty.");
+
+                    return;
+                }
+
+                var botToken =
+                    GetBotTokenFromConfiguration(
+                        service);
+
+                SendMessageToTelegram(
+                    botToken,
+                    chatId,
+                    messageText,
+                    tracer)
+                    .GetAwaiter()
+                    .GetResult();
+
+                context.OutputParameters[Constants.Response] =
+                    JObject.FromObject(new
                     {
-                        var botToken = GetBotTokenFromConfiguration(
-                            service,
-                            tracer);
+                        success = true
+                    }).ToString();
 
-                        SendMessageToTelegram(
-                            botToken,
-                            chatId,
-                            messageText)
-                            .GetAwaiter()
-                            .GetResult();
+                tracer.Trace(
+                    "Telegram message sent successfully.");
+            }
+            catch (Exception ex)
+            {
+                tracer.Trace(
+                    $"Plugin Exception: {ex}");
 
-                        tracer.Trace("Message sent to Telegram successfully.");
-                    }
-
-                    context.OutputParameters[Constants.Response] = "{}";
-
-                    tracer.Trace("End of TelegramOutboundPlugin - {0}",
-                        DateTime.UtcNow);
-                }
-                catch (Exception ex)
-                {
-                    tracer.Trace("Plugin Exception: {0}", ex.ToString());
-
-                    var safeError = ex.Message.Replace("\"", "'");
-                    context.OutputParameters[Constants.Response] =
-                        $"{{\"Error\": \"{safeError}\"}}";
-
-                    throw new InvalidPluginExecutionException(
-                        Constants.UnexpectedErrorMassage);
-                }
+                SetErrorResponse(
+                    context,
+                    ex.Message);
             }
         }
 
-        private string GetBotTokenFromConfiguration(
-            IOrganizationService service,
-            ITracingService tracer)
+        private void SetErrorResponse(
+            IPluginExecutionContext context,
+            string errorMessage)
         {
-            tracer.Trace("Fetching bot token from configuration...");
+            context.OutputParameters[Constants.Response] =
+                JObject.FromObject(new
+                {
+                    success = false,
+                    error = errorMessage
+                }).ToString();
+        }
 
-            var query = new QueryExpression(TelegramConstants.ConfigTableName)
+        private string GetBotTokenFromConfiguration(
+            IOrganizationService service)
+        {
+            var query = new QueryExpression(
+                TelegramConstants.ConfigTableName)
             {
-                ColumnSet = new ColumnSet(TelegramConstants.TokenFieldName),
+                ColumnSet = new ColumnSet(
+                    TelegramConstants.TokenFieldName),
+
                 TopCount = 1
             };
 
             var results = service.RetrieveMultiple(query);
 
-            if (results.Entities.Count > 0)
+            if (results.Entities.Count == 0)
             {
-                var token = results.Entities[0].GetAttributeValue<string>(
-                    TelegramConstants.TokenFieldName);
-
-                if (string.IsNullOrEmpty(token))
-                {
-                    throw new Exception("Bot token field is empty.");
-                }
-
-                tracer.Trace("Token successfully fetched.");
-
-                return token;
+                throw new Exception(
+                    "Telegram configuration not found.");
             }
 
-            throw new Exception("No Telegram configuration record found.");
-        }
+            var token =
+                results.Entities[0]
+                    .GetAttributeValue<string>(
+                        TelegramConstants.TokenFieldName);
 
-        private string ExtractValue(string json, string key)
-        {
-            var match = Regex.Match(
-                json,
-                $"\"{key}\"\\s*:\\s*\"(.*?)\"",
-                RegexOptions.IgnoreCase);
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                throw new Exception(
+                    "Telegram bot token is empty.");
+            }
 
-            return match.Success ? match.Groups[1].Value : string.Empty;
+            return token;
         }
 
         private async Task SendMessageToTelegram(
             string token,
             string chatId,
-            string text)
+            string text,
+            ITracingService tracer)
         {
             using (var client = new HttpClient())
             {
-                var url = $"https://api.telegram.org/bot{token}/sendMessage";
+                var url =
+                    $"https://api.telegram.org/bot{token}/sendMessage";
 
-                var escapedText = text.Replace("\n", "\\n")
-                    .Replace("\"", "\\\"");
-
-                var jsonBody =
-                    $"{{\"chat_id\": \"{chatId}\", \"text\": \"{escapedText}\"}}";
+                var jsonBody = JObject.FromObject(new
+                {
+                    chat_id = chatId,
+                    text = text
+                }).ToString();
 
                 var content = new StringContent(
                     jsonBody,
                     Encoding.UTF8,
                     "application/json");
 
-                var response = await client.PostAsync(url, content);
+                var response =
+                    await client.PostAsync(url, content);
+
+                var responseBody =
+                    await response.Content.ReadAsStringAsync();
+
+                tracer.Trace(
+                    $"Telegram Response: {responseBody}");
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    var errorDetail = await response.Content
-                        .ReadAsStringAsync();
-
                     throw new Exception(
-                        $"HTTP {response.StatusCode} - {errorDetail}");
+                        $"Telegram API Error: {responseBody}");
                 }
             }
         }
