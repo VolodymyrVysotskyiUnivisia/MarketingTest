@@ -1,11 +1,10 @@
-using MarketingTest.Shared;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Query;
-using Newtonsoft.Json.Linq;
 using System;
 using System.Net.Http;
 using System.Text;
-using System.Threading.Tasks;
+using System.Runtime.Serialization.Json;
+using System.Xml.Linq;
 
 namespace MarketingTest.Features.TelegramIntegration
 {
@@ -13,176 +12,95 @@ namespace MarketingTest.Features.TelegramIntegration
     {
         public void Execute(IServiceProvider serviceProvider)
         {
-            var tracer = (ITracingService)serviceProvider
-                .GetService(typeof(ITracingService));
+            var context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));
+            var serviceFactory = (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));
+            var service = serviceFactory.CreateOrganizationService(null);
+            var tracer = (ITracingService)serviceProvider.GetService(typeof(ITracingService));
 
-            var context = (IPluginExecutionContext)serviceProvider
-                .GetService(typeof(IPluginExecutionContext));
-
-            var serviceFactory = (IOrganizationServiceFactory)serviceProvider
-                .GetService(typeof(IOrganizationServiceFactory));
-
-            var service = serviceFactory
-                .CreateOrganizationService(context.UserId);
+            string channelDefId = "";
+            string reqId = "";
 
             try
             {
-                tracer.Trace("TelegramOutboundPlugin started.");
+                tracer.Trace("=== TelegramOutboundPlugin Native Execution Started ===");
 
-                var payload =
-                    context.InputParameters[Constants.Payload]?.ToString();
-
-                tracer.Trace($"Payload received: {payload}");
-
-                if (string.IsNullOrWhiteSpace(payload))
+                if (!context.InputParameters.Contains("payload"))
                 {
-                    SetErrorResponse(
-                        context,
-                        "Payload is empty.");
-
+                    context.OutputParameters["response"] = "{\"Status\":\"NotSent\"}";
                     return;
                 }
 
-                var json = JObject.Parse(payload);
+                string payloadString = context.InputParameters["payload"]?.ToString();
+                tracer.Trace("Payload: " + payloadString);
 
-                var messageText =
-                    json["Message"]?["text"]?.ToString();
+                // ПАРСИНГ БЕЗ NEWTONSOFT.JSON (Використовуємо нативний вбудований парсер Dataverse)
+                var reader = JsonReaderWriterFactory.CreateJsonReader(Encoding.UTF8.GetBytes(payloadString), new System.Xml.XmlDictionaryReaderQuotas());
+                var xml = XElement.Load(reader);
 
-                var chatId =
-                    json["To"]?.ToString();
+                channelDefId = xml.Element("ChannelDefinitionId")?.Value ?? "";
+                reqId = xml.Element("RequestId")?.Value ?? "";
+                string to = xml.Element("To")?.Value ?? "";
+                string fromText = xml.Element("From")?.Value ?? "";
+                string text = xml.Element("Message")?.Element("text")?.Value ?? "";
 
-                if (string.IsNullOrWhiteSpace(messageText))
+                tracer.Trace($"Parsed values - To: {to}, From: {fromText}, ReqId: {reqId}");
+
+                // 1. Шукаємо токен бота
+                string botToken = "";
+                var query = new QueryExpression("tg_telegramconfiguration") { ColumnSet = new ColumnSet("tg_bottoken") };
+
+                if (!string.IsNullOrWhiteSpace(fromText))
                 {
-                    SetErrorResponse(
-                        context,
-                        "Message text is empty.");
-
-                    return;
+                    query.Criteria.AddCondition("tg_name", ConditionOperator.Equal, fromText);
                 }
 
-                if (string.IsNullOrWhiteSpace(chatId))
+                var results = service.RetrieveMultiple(query);
+                if (results.Entities.Count > 0)
                 {
-                    SetErrorResponse(
-                        context,
-                        "Recipient chat id is empty.");
-
-                    return;
+                    botToken = results.Entities[0].GetAttributeValue<string>("tg_bottoken");
                 }
-
-                var botToken =
-                    GetBotTokenFromConfiguration(
-                        service);
-
-                SendMessageToTelegram(
-                    botToken,
-                    chatId,
-                    messageText,
-                    tracer)
-                    .GetAwaiter()
-                    .GetResult();
-
-                context.OutputParameters[Constants.Response] =
-                    JObject.FromObject(new
+                else
+                {
+                    var fallbackQuery = new QueryExpression("tg_telegramconfiguration") { ColumnSet = new ColumnSet("tg_bottoken"), TopCount = 1 };
+                    var fallbackResults = service.RetrieveMultiple(fallbackQuery);
+                    if (fallbackResults.Entities.Count > 0)
                     {
-                        success = true
-                    }).ToString();
+                        botToken = fallbackResults.Entities[0].GetAttributeValue<string>("tg_bottoken");
+                    }
+                }
 
-                tracer.Trace(
-                    "Telegram message sent successfully.");
+                if (string.IsNullOrWhiteSpace(botToken))
+                {
+                    throw new Exception("Bot token not found in Dataverse.");
+                }
+
+                // 2. Відправка в Telegram (збираємо JSON вручну)
+                using (var client = new HttpClient())
+                {
+                    var url = $"https://api.telegram.org/bot{botToken}/sendMessage";
+
+                    // Екрануємо текст, щоб він не зламав JSON (особливо перенесення рядків, як у твоєму тестовому повідомленні)
+                    string escapedText = text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "");
+                    string bodyStr = $"{{\"chat_id\":\"{to}\",\"text\":\"{escapedText}\"}}";
+
+                    var content = new StringContent(bodyStr, Encoding.UTF8, "application/json");
+                    var tgResponse = client.PostAsync(url, content).GetAwaiter().GetResult();
+                    var tgResponseBody = tgResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+                    tracer.Trace("Telegram response: " + tgResponseBody);
+                }
+
+                // 3. Формуємо успішну відповідь
+                string successResponse = $"{{\"ChannelDefinitionId\":\"{channelDefId}\",\"RequestId\":\"{reqId}\",\"Status\":\"Sent\"}}";
+                context.OutputParameters["response"] = successResponse;
+
+                tracer.Trace("Plugin executed successfully.");
             }
             catch (Exception ex)
             {
-                tracer.Trace(
-                    $"Plugin Exception: {ex}");
-
-                SetErrorResponse(
-                    context,
-                    ex.Message);
-            }
-        }
-
-        private void SetErrorResponse(
-            IPluginExecutionContext context,
-            string errorMessage)
-        {
-            context.OutputParameters[Constants.Response] =
-                JObject.FromObject(new
-                {
-                    success = false,
-                    error = errorMessage
-                }).ToString();
-        }
-
-        private string GetBotTokenFromConfiguration(
-            IOrganizationService service)
-        {
-            var query = new QueryExpression(
-                TelegramConstants.ConfigTableName)
-            {
-                ColumnSet = new ColumnSet(
-                    TelegramConstants.TokenFieldName),
-
-                TopCount = 1
-            };
-
-            var results = service.RetrieveMultiple(query);
-
-            if (results.Entities.Count == 0)
-            {
-                throw new Exception(
-                    "Telegram configuration not found.");
-            }
-
-            var token =
-                results.Entities[0]
-                    .GetAttributeValue<string>(
-                        TelegramConstants.TokenFieldName);
-
-            if (string.IsNullOrWhiteSpace(token))
-            {
-                throw new Exception(
-                    "Telegram bot token is empty.");
-            }
-
-            return token;
-        }
-
-        private async Task SendMessageToTelegram(
-            string token,
-            string chatId,
-            string text,
-            ITracingService tracer)
-        {
-            using (var client = new HttpClient())
-            {
-                var url =
-                    $"https://api.telegram.org/bot{token}/sendMessage";
-
-                var jsonBody = JObject.FromObject(new
-                {
-                    chat_id = chatId,
-                    text = text
-                }).ToString();
-
-                var content = new StringContent(
-                    jsonBody,
-                    Encoding.UTF8,
-                    "application/json");
-
-                var response =
-                    await client.PostAsync(url, content);
-
-                var responseBody =
-                    await response.Content.ReadAsStringAsync();
-
-                tracer.Trace(
-                    $"Telegram Response: {responseBody}");
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    throw new Exception(
-                        $"Telegram API Error: {responseBody}");
-                }
+                tracer.Trace("EXCEPTION CAUGHT: " + ex.ToString());
+                string errorResponse = $"{{\"ChannelDefinitionId\":\"{channelDefId}\",\"RequestId\":\"{reqId}\",\"Status\":\"NotSent\"}}";
+                context.OutputParameters["response"] = errorResponse;
             }
         }
     }
