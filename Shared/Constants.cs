@@ -8,13 +8,20 @@ namespace MarketingTest.Shared
 {
     public static class Constants
     {
-        // Базові константи Dataverse
         public const string Target = "Target";
+        public const string Relationship = "Relationship";
+        public const string Create = "create";
+        public const string Update = "update";
+        public const string Delete = "delete";
+
+        public const string UnexpectedErrorMessage = "An unexpected error occurred. Please contact your system administrator.";
+
         public const string Payload = "payload";
         public const string Response = "response";
 
-        // Стандартне повідомлення про помилку згідно з гайдлайном компанії
-        public const string UnexpectedErrorMassage =
-            "An unexpected error occurred. Please contact your system administrator.";
+        public const string StatusKey = "Status";
+
+        public const string StatusSent = "Sent";
+        public const string StatusNotSent = "NotSent";
     }
 }
